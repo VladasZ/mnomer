@@ -7,7 +7,9 @@ use crate::{
     audiosignal::{samples_to_time, AudioSignal, ToneConfiguration},
     repl::repl::ReplApp,
 };
-use std::{convert::TryFrom, f64, fmt::Display, sync::Mutex};
+use std::{convert::TryFrom, f64, fmt::Display, sync::Arc, sync::Mutex};
+
+use cpal::SizedSample;
 
 pub const BASE_BEAT_VALUE: u16 = 4;
 
@@ -79,6 +81,67 @@ pub struct BeatPlayer {
     pub pattern: BeatPattern,
     stream: Option<Stream>,
     start_stop_mtx: Mutex<()>,
+    on_beat: Option<BeatListener>,
+    swap_buffer: Option<BufferSwap>,
+    /// Sample rate and channel count of the running stream, needed to build a
+    /// replacement bar that matches it.
+    stream_config: Option<(f64, usize)>,
+}
+
+/// Hands a freshly built bar to a stream that is already running.
+///
+/// The conversion to the device sample format happens inside, on the calling
+/// thread, so the audio callback only ever takes a ready buffer and never
+/// allocates.
+type BufferSwap = Arc<dyn Fn(AudioSignal<f32>) + Send + Sync>;
+
+/// Called with the index of the beat in the pattern each time a new beat
+/// starts sounding.
+///
+/// It runs on the audio thread, so it must return quickly and must not block.
+/// Anything slow belongs on a thread of your own.
+pub type BeatListener = Arc<dyn Fn(usize) + Send + Sync>;
+
+/// Turns the playback position into a beat number.
+///
+/// The player loops one buffer holding the whole pattern, and every beat in it
+/// is the same length, so the position alone says which beat is sounding. That
+/// makes the beat come from the audio clock rather than a second timer that
+/// would drift away from it.
+struct BeatTracker {
+    samples_per_beat: usize,
+    last: Option<usize>,
+    listener: Option<BeatListener>,
+}
+
+impl BeatTracker {
+    fn new(buffer_samples: usize, beats: usize, listener: Option<BeatListener>) -> Self {
+        BeatTracker {
+            samples_per_beat: (buffer_samples / beats.max(1)).max(1),
+            last: None,
+            listener,
+        }
+    }
+
+    fn retune(&mut self, buffer_samples: usize, beats: usize) {
+        self.samples_per_beat = (buffer_samples / beats.max(1)).max(1);
+    }
+
+    fn report(&mut self, position: usize) {
+        let listener = match &self.listener {
+            Some(listener) => listener,
+            None => return,
+        };
+
+        let beat = position / self.samples_per_beat;
+
+        if self.last == Some(beat) {
+            return;
+        }
+
+        self.last = Some(beat);
+        listener(beat);
+    }
 }
 
 impl ReplApp for BeatPlayer {
@@ -125,10 +188,19 @@ impl BeatPlayer {
             pattern,
             stream: None,
             start_stop_mtx: Mutex::new(()),
+            on_beat: None,
+            swap_buffer: None,
+            stream_config: None,
         }
     }
 
     /// Check whether the beat playback is running or starting
+    /// Listen for each beat while the player runs. Set it before `play_beat`,
+    /// a stream that is already running keeps the listener it was built with.
+    pub fn set_on_beat(&mut self, listener: impl Fn(usize) + Send + Sync + 'static) {
+        self.on_beat = Some(Arc::new(listener));
+    }
+
     pub fn is_playing(&self) -> bool {
         let _lockguard = self.start_stop_mtx.try_lock();
         self.stream.is_some()
@@ -144,6 +216,8 @@ impl BeatPlayer {
             x.pause().expect("Error during pause");
         };
         self.stream = None;
+        self.swap_buffer = None;
+        self.stream_config = None;
     }
 
     /// Set the beat pattern
@@ -208,21 +282,28 @@ impl BeatPlayer {
             return false;
         }
 
-        let restart = if self.is_playing() {
-            self.stop();
-            true
-        } else {
-            false
-        };
-
         let previous_bpm = self.bpm;
         self.bpm = bpm;
 
-        if restart && self.play_beat().is_err() {
-            self.bpm = previous_bpm;
-            false
-        } else {
-            true
+        let Some(swap) = self.swap_buffer.clone() else {
+            return true;
+        };
+
+        let Some(config) = self.stream_config else {
+            return true;
+        };
+
+        // A running stream takes the new bar in place. Rebuilding it would
+        // reopen the audio device and leave a gap every time the tempo moves.
+        match self._fill_playback_buffer(config.0, config.1) {
+            Ok(buffer) => {
+                swap(buffer);
+                true
+            }
+            Err(_) => {
+                self.bpm = previous_bpm;
+                false
+            }
         }
     }
 
@@ -381,16 +462,29 @@ impl BeatPlayer {
             }
         };
 
-        let playback_buffer = match self._fill_playback_buffer(
+        let stream_config = (
             default_config.sample_rate().0 as f64,
             default_config.channels() as usize,
-        ) {
+        );
+
+        let playback_buffer = match self._fill_playback_buffer(stream_config.0, stream_config.1) {
             Ok(audio_signal) => audio_signal,
             Err(msg) => return Err(msg.into()),
         };
 
-        self.stream = match create_cpal_stream(device, default_config, playback_buffer) {
-            Ok(x) => Some(x),
+        self.stream_config = Some(stream_config);
+
+        match create_cpal_stream(
+            device,
+            default_config,
+            playback_buffer,
+            self.pattern.0.len(),
+            self.on_beat.clone(),
+        ) {
+            Ok((stream, swap)) => {
+                self.stream = Some(stream);
+                self.swap_buffer = Some(swap);
+            }
             Err(y) => return Err(y),
         };
 
@@ -408,60 +502,95 @@ fn create_cpal_stream(
     device: cpal::Device,
     config: cpal::SupportedStreamConfig,
     playback_buffer: AudioSignal<f32>,
-) -> Result<Stream, String> {
+    beats: usize,
+    on_beat: Option<BeatListener>,
+) -> Result<(Stream, BufferSwap), String> {
     let sampletype = config.sample_format();
-    let err_fn = |err| eprintln!("an error occurred on the output audio stream: {}", err);
-    let my_config = config.into();
+    let my_config: cpal::StreamConfig = config.into();
 
-    //TODO: unify these lambdas somehow
-    let stream = match sampletype {
+    match sampletype {
         SampleFormat::F32 => {
-            let mut playback_buffer: AudioSignal<f32> = playback_buffer;
-            device.build_output_stream(
-                &my_config,
-                move |data, _| {
-                    for sample in data.iter_mut() {
-                        *sample = playback_buffer.get_next_sample();
-                    }
-                },
-                err_fn,
-                None,
-            )
+            build_stream::<f32>(&device, &my_config, playback_buffer, beats, on_beat)
         }
         SampleFormat::I16 => {
-            let mut playback_buffer: AudioSignal<i16> = playback_buffer.into();
-            device.build_output_stream(
-                &my_config,
-                move |data, _| {
-                    for sample in data.iter_mut() {
-                        *sample = playback_buffer.get_next_sample();
-                    }
-                },
-                err_fn,
-                None,
-            )
+            build_stream::<i16>(&device, &my_config, playback_buffer, beats, on_beat)
         }
         SampleFormat::U16 => {
-            let mut playback_buffer: AudioSignal<u16> = playback_buffer.into();
-            device.build_output_stream(
-                &my_config,
-                move |data, _| {
-                    for sample in data.iter_mut() {
-                        *sample = playback_buffer.get_next_sample();
-                    }
-                },
-                err_fn,
-                None,
-            )
+            build_stream::<u16>(&device, &my_config, playback_buffer, beats, on_beat)
         }
         _ => todo!(),
+    }
+}
+
+/// Builds a stream that can take a new bar without being torn down.
+///
+/// The tempo decides how long the bar buffer is, so changing it needs a new
+/// buffer. Rebuilding the whole stream for that reopened the audio device and
+/// left an audible gap on every tempo change, so the buffer is handed over
+/// through a slot instead and the device is opened once per run.
+fn build_stream<T>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    playback_buffer: AudioSignal<f32>,
+    beats: usize,
+    on_beat: Option<BeatListener>,
+) -> Result<(Stream, BufferSwap), String>
+where
+    T: SizedSample + Send + 'static,
+    AudioSignal<f32>: Into<AudioSignal<T>>,
+{
+    let err_fn = |err| eprintln!("an error occurred on the output audio stream: {}", err);
+
+    let pending: Arc<Mutex<Option<AudioSignal<T>>>> = Arc::new(Mutex::new(None));
+    let slot = Arc::clone(&pending);
+
+    let mut current: AudioSignal<T> = playback_buffer.into();
+    let mut tracker = BeatTracker::new(current.signal.len(), beats, on_beat);
+
+    let stream = device.build_output_stream(
+        config,
+        move |data: &mut [T], _| {
+            // try_lock, never lock. Missing a swap costs one buffer of delay,
+            // blocking here would cost a dropout.
+            if let Ok(mut pending) = slot.try_lock() {
+                if let Some(mut next) = pending.take() {
+                    // Carry the position over as a fraction of the bar, so the
+                    // beat keeps counting instead of snapping back to one.
+                    let phase = current.index as f64 / current.signal.len().max(1) as f64;
+                    next.index = (phase * next.signal.len() as f64) as usize;
+
+                    tracker.retune(next.signal.len(), beats);
+                    current = next;
+                }
+            }
+
+            for sample in data.iter_mut() {
+                *sample = current.get_next_sample();
+            }
+
+            tracker.report(current.index);
+        },
+        err_fn,
+        None,
+    );
+
+    let stream = match stream {
+        Ok(stream) => stream,
+        Err(x) => {
+            return Err(format!(
+                "Streamconfig {:?} is not supported, got error: {:?}",
+                config, x
+            ))
+        }
     };
 
-    match stream {
-        Ok(stream) => Ok(stream),
-        Err(x) => Err(format!(
-            "Streamconfig {:?} is not supported, got error: {:?}",
-            my_config, x
-        )),
-    }
+    let swap: BufferSwap = Arc::new(move |buffer: AudioSignal<f32>| {
+        let converted: AudioSignal<T> = buffer.into();
+        match pending.lock() {
+            Ok(mut slot) => *slot = Some(converted),
+            Err(_) => eprintln!("beat buffer slot is poisoned, tempo change dropped"),
+        }
+    });
+
+    Ok((stream, swap))
 }
